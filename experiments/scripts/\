@@ -1,0 +1,252 @@
+import numpy as np
+import cv2
+import os
+import matplotlib.pyplot as plt
+import json
+import warnings
+import sys
+import matplotlib.cm as cm
+
+# TODO: CHeck if there are negatives
+
+warnings.filterwarnings("ignore")
+
+SNR_THRESHOLD = 1.5
+
+def extract_timestamp_and_layer(filename):
+    parts = filename.split("_")
+    if len(parts) < 4:
+        return None, None
+
+    timestamp = int(parts[2])
+    layer = parts[3].replace(".npy", "").replace("layer", "")
+
+    try:
+        layer_num = int(layer)
+    except ValueError:
+        return None, None
+
+    return timestamp, layer_num
+
+def sorted_filenames_from_folder(folder_name):
+    all_files = os.listdir(folder_name)
+    valid_files = [f for f in all_files if "pre" not in f and f.endswith('.npy') and extract_timestamp_and_layer(f)[0] is not None]
+    valid_files.sort(key=lambda x: extract_timestamp_and_layer(x))
+    uniq_timestamps = set([extract_timestamp_and_layer(f)[0] for f in valid_files])
+    return valid_files, uniq_timestamps
+
+def load_sorted_activations(folder_name): # 120 (images) * 34 (layers)
+    # Image_{i}: {Layer_{j}: {Node_{k}: [activations]}}
+    sorted_files, uniq_timestamps = sorted_filenames_from_folder(folder_name)
+    activations = {}
+    img_count = 0
+    counter = 0
+    for filename in sorted_files:
+        timestamp, layer_name = extract_timestamp_and_layer(filename)
+        if img_count not in activations:
+            activations[img_count] = {}
+        if layer_name not in activations[img_count]:
+            activations[img_count][layer_name] = {}
+        activations[img_count][layer_name] = np.load(os.path.join(folder_name, filename))
+        counter += 1
+        if counter == 34:
+            counter = 0
+            img_count += 1
+
+    nodes_values = {}
+    for img in activations:
+        for layer in activations[img]:
+            if nodes_values[layer] is None:
+                nodes_values[layer] = []
+            curr_act_shape = activations[img][layer].shape
+            node_count = curr_act_shape[1]
+            for node in range(node_count):
+                if nodes_values[layer][node] is None:
+                    nodes_values[layer][node] = []
+                if layer != 34:
+                    squeezed = np.squeeze(activations[img][layer])
+                    node_act = squeezed[node]
+                    mean_of_node = np.mean(node_act)
+                    nodes_values[layer][node].append(mean_of_node)
+                elif layer == 34:
+                    nodes_values[layer][node].append(activations[img][layer][0][node])
+
+    return nodes_values, len(uniq_timestamps)
+
+def calculate_snr(fft_values, bins, skip):
+    snr_values = []
+    for i in range(len(fft_values)):
+        if i < len(fft_values) - (bins + skip):
+            right_noise = fft_values[i+skip:i+skip+bins+1]
+        else:
+            right_noise = fft_values[i+skip:len(fft_values)]
+        if i > skip + bins:
+            left_noise = fft_values[i-skip-bins:i-skip+1]
+        else:
+            left_noise = fft_values[0:max(i-skip, 0)]
+        noise_baseline = np.append(left_noise, right_noise)
+        baseline_avg = np.average(noise_baseline)
+        if baseline_avg == 0:
+            snr = 0
+        else:
+            snr = fft_values[i] / baseline_avg
+        snr_values.append(snr)
+    return snr_values
+
+def calculate_snr_for_node(grads, bins=3, skip=1):
+    # Grads is 120 values for a node in a particular layer
+    fft_output = np.fft.fft2(grads)
+    fft_output = np.abs(fft_output)
+    fft_output[0, 0] = 0  # Remove the DC component
+    fft_output = np.abs(fft_output).flatten()
+    snr_values = calculate_snr(fft_output, bins, skip)
+    return np.mean(snr_values)
+
+def is_high_snr(data, layer, img, node):
+    snr = calculate_snr_for_node(data[layer][node], img)
+    return snr > SNR_THRESHOLD, snr
+
+def get_interesting_nodes(data, layer):
+    node_scores = {}
+    node_counts = {}
+    node_imgs_detail = {}
+
+    for node in data[layer]:
+        for img in range(len(data[layer][0])): # Generally 120 images
+            is_high, snr = is_high_snr(data, layer, img, node)
+            if not is_high:
+                continue
+
+            if node not in node_scores:
+                node_scores[node] = [snr, 1]
+                node_imgs_detail[node] = [{'snr': snr}]
+            else:
+                node_scores[node][0] += snr
+                node_scores[node][1] += 1
+                node_imgs_detail[node].append({'snr': snr})
+
+    for node in node_scores:
+        node_counts[node] = node_scores[node][1]
+        node_scores[node] = node_scores[node][0] / node_scores[node][1]
+    node_scores = {k: v for k, v in sorted(node_scores.items(), key=lambda item: item[1], reverse=True)}
+    return node_scores, node_counts, node_imgs_detail
+
+def save_to_json(node_ids, node_counts, node_imgs_detail, layer, folder_name):
+    filename=f"{folder_name}/layer_evolution/interesting_nodes_layer_{layer}.json"
+    with open(filename, 'w') as outfile:
+        for idx, node in enumerate(node_ids):
+            if idx == 0:
+                outfile.write("[\n")
+            else:
+                outfile.write(",\n")
+
+            outfile.write("\t{\n")
+            outfile.write("\t\t\"node_id\": {},\n".format(node))
+            outfile.write("\t\t\"count\": {},\n".format(node_counts[node]))
+            outfile.write("\t\t\"image_details\": {}\n".format(json.dumps(node_imgs_detail[node])))
+            outfile.write("\t}")
+
+        outfile.write("\n]")
+
+def plot_layer_evolution(flicker_data, layer, folder_name):
+    flicker_interesting_nodes, flicker_counts, flicker_node_imgs_detail = get_interesting_nodes(flicker_data, layer)
+    flicker_interesting_nodes = list(flicker_interesting_nodes.keys())
+    total_nodes = len(flicker_data[0][layer])
+    percentage_interesting_fl = len(flicker_interesting_nodes) / total_nodes * 100
+    sample_shape = flicker_data[0][layer][list(flicker_data[0][layer].keys())[0]].shape
+    fig, axs = plt.subplots(1, 2, figsize=(14, 18))
+    title_info_fl = (f'Layer {layer} | Total Nodes: {total_nodes} | Interesting Nodes: {len(flicker_interesting_nodes)} | '
+                     f'Shape: {sample_shape} | '
+                     f'Percentage Interesting: {percentage_interesting_fl:.2f}% | '
+                     f'SNR Threshold: {SNR_THRESHOLD}')
+
+    fig.suptitle(title_info_fl, fontsize=14)
+
+    colors_for_nodes = {}
+    for idx, node in enumerate(flicker_data[0][layer]):
+        colors_for_nodes[node] = cm.jet(idx / total_nodes)
+
+    # TODO: Make y axis SNR
+
+    # Plot for interesting nodes
+    for idx, node in enumerate(flicker_interesting_nodes):
+        flicker_vals = []
+        for img in flicker_data:
+            fft_output = np.fft.fft2(flicker_data[img][layer][node])
+            fft_output = np.abs(fft_output)
+            fft_output[0, 0] = 0  # Remove the DC component
+            flicker_vals.append(np.abs(fft_output).flatten())
+        flicker_vals = np.array(flicker_vals)
+        flicker_mean = np.mean(flicker_vals, axis=0)
+        flicker_std = np.std(flicker_vals, axis=0)
+        flicker_std = flicker_std / np.sqrt(len(flicker_vals))
+
+        axs[0].plot(flicker_mean, label=f'Node {node}', color=colors_for_nodes[node])
+        axs[0].fill_between(range(len(flicker_mean)), flicker_mean - flicker_std, flicker_mean + flicker_std, alpha=0.2)
+
+    axs[0].set(title=f'Flicker (Interesting Nodes)', ylabel='Mean Gradient')
+    axs[0].legend(loc='upper right', bbox_to_anchor=(1.1, 1.05))
+
+    # Plot for all nodes
+    for node in flicker_data[0][layer]:
+        flicker_vals = []
+        for img in flicker_data:
+            fft_output = np.fft.fft2(flicker_data[img][layer][node])
+            fft_output = np.abs(fft_output)
+            fft_output[0, 0] = 0
+            flicker_vals.append(np.abs(fft_output).flatten())
+        flicker_vals = np.array(flicker_vals)
+        flicker_mean = np.mean(flicker_vals, axis=0)
+        flicker_std = np.std(flicker_vals, axis=0)
+        flicker_std = flicker_std / np.sqrt(len(flicker_vals))
+
+        axs[1].plot(flicker_mean, label=f'Node {node}', color=colors_for_nodes[node])
+        axs[1].fill_between(range(len(flicker_mean)), flicker_mean - flicker_std, flicker_mean + flicker_std, alpha=0.2)
+
+    title_info_fl_all = (f'Showing all Nodes')
+    axs[1].set(title=f'Flicker (All Nodes): {title_info_fl_all}', ylabel='Mean Gradient')
+
+    output_dir = f"{folder_name}/layer_evolution"
+    if not os.path.exists(output_dir):
+        os.mkdir(output_dir)
+
+    plt.savefig(os.path.join(output_dir, f"layer_{layer}.png"))
+    plt.close()
+
+    save_to_json(flicker_interesting_nodes, flicker_counts, flicker_node_imgs_detail, layer, folder_name)
+
+    return total_nodes, len(flicker_interesting_nodes)
+
+def are_activations_same(activations1, activations2, rtol=1e-5, atol=1e-8):
+    for img in activations1:
+        for layer in activations1[img]:
+            for node in activations1[img][layer]:
+                if not np.allclose(activations1[img][layer][node], activations2[img][layer][node], rtol=rtol, atol=atol):
+                    return False
+    return True
+
+def analysis(flicker_folder):
+    flicker_activations, nodes_values, img_count = load_sorted_activations(flicker_folder)
+
+    # activations:  Image_{i}: {Layer_{j}: {Node_{k}: [activations]}}
+    # nodes_values: {Layer_{j}: {Node_{k}: [activations]}}
+    layers = list(flicker_activations[0].keys())
+    totals = []
+    interestings = []
+    for layer in layers:
+        if layer == 34:
+            continue
+        total, interesting = plot_layer_evolution(nodes_values, layer, flicker_folder)
+        totals.append(total)
+        interestings.append(interesting)
+
+    print(f"Total Nodes: {sum(totals)}")
+    print(f"Total Interesting Nodes: {sum(interestings)}")
+    print(f"Percentage Interesting Nodes: {sum(interestings) / sum(totals) * 100:.2f}%")
+
+
+if __name__ == '__main__':
+    flicker_folder = "grads"
+    analysis(flicker_folder)
+
+
